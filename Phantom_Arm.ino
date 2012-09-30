@@ -1,6 +1,9 @@
-
+#define DEBUG
 //=============================================================================
-//Project PhantomX Reactor Arm - Kurt's Arm acting like Backhoe
+//Project Kurt's PhantomX Reactor Arm -  With a few different modes of operatoin
+//  an IK mode based in part on code by Michael E. Ferguson... X, Y, Z all computed
+//  An IK mode where the Base rotate is done independent and then IK for the other two directions
+//  a Backhoe mode based on my my BackHoe...
 //=============================================================================
 
 //=============================================================================
@@ -22,6 +25,10 @@
 /* Servo IDs */
 enum {
   SID_BASE=1, SID_RSHOULDER, SID_LSHOULDER, SID_RELBOW, SID_LELBOW, SID_WRIST, SID_WRISTROT, SID_GRIP};
+
+enum {
+  IKM_IK3D, IKM_IK2D, IKM_BACKHOE};
+
 #if 0
 static const byte pgm_axdIDs[] PROGMEM = {
   SID_BASE, 
@@ -34,9 +41,29 @@ static const byte pgm_axdIDs[] PROGMEM = {
   SID_GRIP};
 #endif
 
+
 #define CNT_SERVOS  8 //(sizeof(pgm_axdIDs)/sizeof(pgm_axdIDs[0]))
 
-// Define Ranges
+// Define some Min and Maxs for IK Movements...
+//                y   Z
+//                |  /
+//                |/
+//            ----+----X (X and Y are flat on ground, Z is up in air...
+//                |
+//                |
+#define IK_MAX_X  300
+#define IK_MIN_X  -300
+
+#define IK_MAX_Y  350
+#define IK_MIN_Y  50
+
+#define IK_MAX_Z  300
+#define IK_MIN_Z  20
+
+#define IK_MAX_GA  90
+#define IK_MIN_GA   -90
+
+// Define Ranges for the different servos...
 #define BASE_MIN    0
 #define BASE_MAX    1023
 
@@ -54,6 +81,18 @@ static const byte pgm_axdIDs[] PROGMEM = {
 
 #define GRIP_MIN     0
 #define GRIP_MAX     512
+
+// Define some lengths and offsets used by the arm
+#define BaseHeight          85L //110    // (L0)about 120mm 
+#define ShoulderLength      150L    // (L1)Not sure yet what to do as the servo is not directly in line,  Probably best to offset the angle?
+//                                 // X is about 140, y is about 40 so sqrt is Hyp is about 155, so maybe about 21 degrees offset
+#define ShoulderServoOffset  72L    // should offset us some...
+#define ElbowLength          147L   //(L2)Length of the Arm from Elbow Joint to Wrist Joint
+#define WristLength         106L //137    // (L3)Wrist length including Wrist rotate
+#define G_OFFSET            0      // Offset for static side of gripper?
+#define RToD                57.295779  // Radians to degrees.
+
+
 //=============================================================================
 // Global Objects
 //=============================================================================
@@ -64,7 +103,13 @@ BioloidController bioloid = BioloidController(1000000);
 // Global Variables...
 //=============================================================================
 boolean         g_fArmActive = false;   // Is the arm logically on?
-boolean         g_fBackHoe = true;      // Are we in Back hoe mode?  or in IK mode...
+byte            g_bIKMode = IKM_IK3D;   // Which mode of operation are we in...
+
+// Current IK values
+int            g_sIKGA;                  // IK Gripper angle..
+int            g_sIKX;                  // Current X value in mm
+int            g_sIKY;                  //
+int            g_sIKZ;
 
 // Values for current servo values for the different joints
 int             g_sBase;                // Current Base servo value
@@ -74,9 +119,21 @@ int             g_sWrist;               // Current Wrist value
 int             g_sWristRot;            // Current Wrist rotation
 int             g_sGrip;                // Current Grip position
 
+// BUGBUG:: I hate too many globals...
+int sBase, sShoulder, sElbow, sWrist, sWristRot, sGrip;
+
+
 // Message informatino
 unsigned long   ulLastMsgTime;          // Keep track of when the last message arrived to see if controller off
 byte            buttonsPrev;            // will use when we wish to only process a button press once
+
+//
+#ifdef DEBUG
+boolean        g_fDebugOutput = false;
+#endif
+
+// Forward references
+extern boolean ProcessUserInputBackHoe(void);
 
 //===================================================================================================
 // Setup 
@@ -98,12 +155,14 @@ void setup() {
   // Read in the current positions...
   bioloid.readPose();
   // Start off to put arm to sleep...
+  Serial.println("Kurt's Arm");
+  
   PutArmToSleep();
 }
 //===================================================================================================
+// loop: Our main Loop!
 //===================================================================================================
 void loop() {
-  int sBase, sShoulder, sElbow, sWrist, sWristRot, sGrip;
   boolean fChanged = false;
   if (command.ReadMsgs()) {
     // See if the Arm is active yet...
@@ -115,39 +174,45 @@ void loop() {
       sGrip = g_sGrip;
       sWristRot = g_sWristRot;
 
+      if ((command.buttons & BUT_R1) && !(buttonsPrev & BUT_R1)) {
+        if (++g_bIKMode > IKM_BACKHOE)
+          g_bIKMode = 0; 
+
+        // For now lets always move arm to the home position of the new input method...
+        // Later maybe we will get the current position and covert to the coordinate system
+        // of the current input method.
+        MoveArmToHome();      
+
+      }
+#ifdef DEBUG
+      if ((command.buttons & BUT_R3) && !(buttonsPrev & BUT_R3)) {
+        g_fDebugOutput = !g_fDebugOutput;
+      }
+#endif
       // Going to use L6 in combination with the right joystick to control both the gripper and the 
       // wrist rotate...
-      if (command.buttons & BUT_L6) {
+      else if (command.buttons & BUT_L6) {
         sGrip = min(max(sGrip + command.lookV/2, GRIP_MIN), GRIP_MAX);
         sWristRot = min(max(g_sWristRot + command.lookH/6, WROT_MIN), WROT_MAX);
         fChanged = (sGrip != g_sGrip) || (sWristRot != g_sWristRot);
       }
       else {
-        // lets update positions with the 4 joystick values
-        // First the base
-        sBase = min(max(g_sBase + command.walkH/6, BASE_MIN), BASE_MAX);
-        if (sBase != g_sBase)
-          fChanged = true;
+        switch (g_bIKMode) {
+        case IKM_IK3D:
+          fChanged |= ProcessUserInput3D();
+          break;
+        case IKM_IK2D:
+          fChanged |= ProcessUserInput2D();
+          break;
 
-        // Now the Boom
-        sShoulder = min(max(g_sShoulder + command.lookV/6, SHOULDER_MIN), SHOULDER_MAX);
-        if (sShoulder != g_sShoulder)
-          fChanged = true;
-
-        // Now the Dipper 
-        sElbow = min(max(g_sElbow + command.walkV/6, ELBOW_MIN), ELBOW_MAX);
-        if (sElbow != g_sElbow)
-          fChanged = true;
-
-        // Bucket Curl
-        sWrist = min(max(g_sWrist + command.lookH/6, WRIST_MIN), WRIST_MAX);
-        if (sWrist != g_sWrist)
-          fChanged = true;
+        case IKM_BACKHOE:
+          fChanged |= ProcessUserInputBackHoe();
+          break;
+        }
       }
-
       if (fChanged) {
-        MoveArmTo(sBase, sShoulder, sElbow, sWrist, 512, sGrip, 100, true);
-      } 
+        MoveArmTo(sBase, sShoulder, sElbow, sWrist, sWristRot, sGrip, 100, true);
+      }
       else if (bioloid.interpolating > 0) {
         bioloid.interpolateStep();
       }
@@ -170,12 +235,83 @@ void loop() {
     }
   }
 } 
+//===================================================================================================
+// ProcessUserInput3D: Process the Userinput when we are in 3d Mode
+//===================================================================================================
+boolean ProcessUserInput3D(void) {
+  // We Are in IK mode, so figure out what position we would like the Arm to move to.
+  // We have the Coordinates system like:
+  //
+  //                y   Z
+  //                |  /
+  //                |/
+  //            ----+----X (X and Y are flat on ground, Z is up in air...
+  //                |
+  //                |
+  //
+  boolean fChanged = false;
+  int   sIKX;                  // Current X value in mm
+  int   sIKY;                  //
+  int   sIKZ;
+  int   sIKGA;
 
+  sIKX = min(max(g_sIKX + command.walkH/6, IK_MIN_X), IK_MAX_X);
+  sIKY = min(max(g_sIKY + command.walkV/6, IK_MIN_Y), IK_MAX_Y);
+  sIKZ = min(max(g_sIKZ + command.lookV/6, IK_MIN_Z), IK_MAX_Z);
+  sIKGA = min(max(g_sIKGA + command.lookH/6, IK_MIN_GA), IK_MAX_GA);  // Currently in Servo coords...
+
+  fChanged = (sIKX != g_sIKX) || (sIKY != g_sIKY) || (sIKZ != g_sIKZ) || (sIKGA != g_sIKGA) ;
+
+  if (fChanged) {
+    doArmIK(true, sIKX, sIKY, sIKZ, sIKGA);
+  }
+  return fChanged;
+}
+
+//===================================================================================================
+// ProcessUserInput2D: Process the Userinput when we are in 3d Mode
+//===================================================================================================
+boolean ProcessUserInput2D() {
+  return false;  // Not implemented yet so no changes...
+}
+//===================================================================================================
+// ProcessUserInputBackHoe: Process the Userinput when we are in 3d Mode
+//===================================================================================================
+boolean ProcessUserInputBackHoe() {
+  // lets update positions with the 4 joystick values
+  // First the base
+  boolean fChanged = false;
+  sBase = min(max(g_sBase + command.walkH/6, BASE_MIN), BASE_MAX);
+  if (sBase != g_sBase)
+    fChanged = true;
+
+  // Now the Boom
+  sShoulder = min(max(g_sShoulder + command.lookV/6, SHOULDER_MIN), SHOULDER_MAX);
+  if (sShoulder != g_sShoulder)
+    fChanged = true;
+
+  // Now the Dipper 
+  sElbow = min(max(g_sElbow + command.walkV/6, ELBOW_MIN), ELBOW_MAX);
+  if (sElbow != g_sElbow)
+    fChanged = true;
+
+  // Bucket Curl
+  sWrist = min(max(g_sWrist + command.lookH/6, WRIST_MIN), WRIST_MAX);
+  if (sWrist != g_sWrist)
+    fChanged = true;
+  return fChanged;
+}
 //===================================================================================================
 // MoveArmToHome
 //===================================================================================================
 void MoveArmToHome(void) {
-  MoveArmTo(512, 512, 330, 690, 512, 512, 500, true);
+
+  if (g_bIKMode != IKM_BACKHOE) {
+    doArmIK(true, 0, (2*ElbowLength)/3+WristLength, BaseHeight+(2*ShoulderLength)/3, 0);
+    MoveArmTo(sBase, sShoulder, sElbow, sWrist, 512, 256, 500, true);
+  }
+  else
+    MoveArmTo(512, 512, 330, 690, 512, 256, 500, true);
 }
 
 //===================================================================================================
@@ -183,7 +319,7 @@ void MoveArmToHome(void) {
 //===================================================================================================
 void PutArmToSleep(void) {
   g_fArmActive = false;
-  MoveArmTo(512, 212, 212, 512, 512, 512, 1000, true);
+  MoveArmTo(512, 212, 212, 512, 512, 256, 1000, true);
 }
 
 //===================================================================================================
@@ -191,6 +327,23 @@ void PutArmToSleep(void) {
 //===================================================================================================
 void MoveArmTo(int sBase, int sShoulder, int sElbow, int sWrist, int sWristRot, int sGrip, int wTime, boolean fWait) {
 
+#ifdef DEBUG
+   if (g_fDebugOutput) {
+     Serial.print("[");
+     Serial.print(sBase, DEC);
+     Serial.print(" ");
+     Serial.print(sShoulder, DEC);
+     Serial.print(" ");
+     Serial.print(sElbow, DEC);
+     Serial.print(" ");
+     Serial.print(sWrist, DEC);
+     Serial.print(" ");
+     Serial.print(sWristRot, DEC);
+     Serial.print(" ");
+     Serial.print(sGrip, DEC);
+     Serial.println("]");
+   }
+#endif
   // where to wait for last move to complete?
   bioloid.setNextPose(SID_BASE, sBase);
 
@@ -238,37 +391,135 @@ void MoveArmTo(int sBase, int sShoulder, int sElbow, int sWrist, int sWristRot, 
 }
 
 //===================================================================================================
+// Convert radians to servo position offset. 
+//===================================================================================================
+int radToServo(float rads){
+  float val = (rads*100)/51 * 100;
+  return (int) val;
+}
+
+
+//===================================================================================================
+// Compute Arm IK for 3DOF+Mirrors+Gripper - was based on code by Michael E. Ferguson
+// Hacked up by me, to allow different options...
+//===================================================================================================
+void doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sGrip)
+{
+#ifdef DEBUG
+   if (g_fDebugOutput) {
+     Serial.print("(");
+     Serial.print(sIKX, DEC);
+     Serial.print(",");
+     Serial.print(sIKY, DEC);
+     Serial.print(",");
+     Serial.print(sIKZ, DEC);
+     Serial.print(",");
+     Serial.print(sGrip, DEC);
+     Serial.print(")=");
+   }
+#endif
+  // first, make this a 2DOF problem... by solving base
+  int sol0 = radToServo(atan2(sIKX,sIKY));
+  // remove gripper offset from base
+  int t = sqrt(sq((long)sIKX)+sq((long)sIKY));
+  // BUGBUG... Not sure about G here
+#define G 30   
+  sol0 -= radToServo(atan2((G/2)-G_OFFSET,t));
+
+  // convert to sIKX/sIKZ plane, remove wrist, prepare to solve other DOF           
+  long trueX = t - (long)((float)WristLength*cos(sGrip));   
+  long trueZ = sIKZ - BaseHeight - (long)((float)WristLength*sin(sGrip));
+
+  long im = sqrt(sq(trueX)+sq(trueZ));        // length of imaginary arm      
+
+  float q1 = atan2(trueZ,trueX);              // angle between im and X axis
+  long d1 = sq(ShoulderLength) - sq(ElbowLength) + sq((long)im);
+  long d2 = 2*ShoulderLength*im;
+  float q2 = acos((float)d1/float(d2));
+  q1 = q1 + q2;
+  int sol1 = radToServo(q1-1.57);
+
+  d1 = sq(ShoulderLength)-sq((long)im)+sq(ElbowLength);
+  d2 = 2*ElbowLength*ShoulderLength;
+  q2 = acos((float)d1/(float)d2);
+  int sol2 = radToServo(3.14-q2);
+
+  // solve for wrist rotate
+  int sol3 = radToServo(3.2 + sGrip - q1 - q2 );
+
+#ifdef DEBUG
+   if (g_fDebugOutput) {
+     Serial.print("<");
+     Serial.print(sol0, DEC);
+     Serial.print(",");
+     Serial.print(trueX, DEC);
+     Serial.print(",");
+     Serial.print(trueZ, DEC);
+     Serial.print(",");
+     Serial.print(sol1, DEC);
+     Serial.print(",");
+     Serial.print(sol2, DEC);
+     Serial.print(",");
+     Serial.print(sol3, DEC);
+     Serial.print(">");
+   }
+#endif   
+
+  // Lets calculate the actual servo values.
+  sBase = min(max(512 - sol0, BASE_MIN), BASE_MAX);
+
+  sShoulder = min(max(512 - sol1, SHOULDER_MIN), SHOULDER_MAX);
+
+  // Magic Number 819???
+  sElbow = min(max(819 - sol2, SHOULDER_MIN), SHOULDER_MAX);
+
+#define Wrist_Offset 512
+  sWrist = min(max(Wrist_Offset + sol3, WRIST_MIN), WRIST_MAX);
+
+  // Remember our current IK positions
+  g_sIKX = sIKX; 
+  g_sIKY = sIKY;
+  g_sIKZ = sIKZ;
+  g_sGrip = sGrip;
+}
+
+
+//===================================================================================================
 // ArmIK: compute the desired angles for each of the servos given a desired coordinate.  We will start
 //   off doing floating point math as it is easier... Also we may go in with given servo angles
 //   for the Wrist...
 //===================================================================================================
-#if 1
-// Define some lengths and offsets used by the arm
-#define BaseHeight          120    // about 120mm 
-#define ShoulderLength      155    // Not sure yet what to do as the servo is not directly in line,  Probably best to offset the angle?
-//                                 // X is about 140, y is about 40 so sqrt is Hyp is about 155, so maybe about 21 degrees offset
-#define ShoulderServoOffset  72    // should offset us some...
-#define ElbowLength          147   //Length of the Arm from Elbow Joint to Wrist Joint
-#define WristLength         137    // Wrist length including Wrist rotate
-#define RToD                57.295779  
+#if 0
 
-boolean ArmIk(float WristX, float WristY, float z, int g, float wa, int wr) //Here's all the Inverse Kinematics to control the arm
+boolean ArmIk(float IKGripperPosX, float IKGripperPosY, float sBase, float WristAngle, int sWristRot, int sGrip) //Here's all the Inverse Kinematics to control the arm
 {
-  // First calculate the length from the shoulder to the wrist
-  float IKSW = sqrt(((WristY-BaseHeight)*(WristY-BaseHeight))+(WristX*WristX));
+  // First calculate the length from the shoulder to the gripper
+  // We will first adjust the IKGripperPosY by the base height so we don't have to do this everywhere in
+  // this functions
+  IKGripperPosY -= BaseHeight;
+  float IKSW = sqrt((IKGripperPosY*IKGripperPosY)+(IKGripperPosX*IKGripperPosX));
+
+  // Now lets compute the Wrist position of the wrist given the Gripper position plus it's angle
+  // and it's length
+  float IKWristPosX = IKGripperPosX - (cos(WristAngle) * WristLength);
+  float IKWristPosY = IKGripperPosY - (sin(WristAngle) * WristLength);
+
+  // Calculate a new length between shoulder and Wrist 
+  IKSW = sqrt((IKWristPosX*IKWristPosX)+(IKGripperPosY*IKGripperPosY));
 
   // Compute angle between SW lien and ground in radians.
-  float A1 = atan((WristY-BaseHeight)/WristX);
+  float A1 = atan(IKWristPosY/IKWristPosX);
 
   float A2 = acos((ShoulderLength*ShoulderLength-ElbowLength*ElbowLength+IKSW*IKSW)/((ShoulderLength*2)*IKSW));
-  float Elbow = acos((ShoulderLength*ShoulderLength+ElbowLength*ElbowLength-IKSW*IKSW)/((ShoulderLength*2)*ElbowLength));
-  float Shoulder = A1 + A2;
-  Elbow = Elbow * RToD;
-  Shoulder = Shoulder * RToD;
-  if((int)Elbow <= 0 || (int)Shoulder <= 0)
+  float IKElbow = acos((ShoulderLength*ShoulderLength+ElbowLength*ElbowLength-IKSW*IKSW)/((ShoulderLength*2)*ElbowLength));
+  float IKShoulder = A1 + A2;
+
+  IKElbow = IKElbow * RToD;
+  IKShoulder = IKShoulder * RToD;
+  if((int)IKElbow <= 0 || (int)IKShoulder <= 0)
     return false;
 
-  float Wris = abs(wa - Elbow - Shoulder) - 90;
+  float IKWrist = abs(WristAngle - IKElbow - IKShoulder) - 90;
 #if 0  
   Elb.write(180 - Elbow);
   Shldr.write(Shoulder);
@@ -287,6 +538,15 @@ boolean ArmIk(float WristX, float WristY, float z, int g, float wa, int wr) //He
 
 }
 #endif
+
+
+
+
+
+
+
+
+
 
 
 
