@@ -12,7 +12,8 @@
 #define OPT_WRISTROT  
 #define ARBOTIX_TO  1000      // if no message for a second probably turned off...
 #define DEADZONE    3        // deadzone around center of joystick values
-
+#define SOUND_PIN    1      // Tell system we have added speaker to IO pin 1
+#define MAX_SERVO_DELTA_PERSEC 512
 //=============================================================================
 // Global Include files
 //=============================================================================
@@ -29,17 +30,9 @@ enum {
 enum {
   IKM_IK3D, IKM_IK2D, IKM_BACKHOE};
 
-#if 0
-static const byte pgm_axdIDs[] PROGMEM = {
-  SID_BASE, 
-  SID_RSHOULDER, SID_LSHOULDER, 
-  SID_RELBOW, SID_LELBOW, 
-  SID_WRIST, 
-#ifdef OPT_WRISTROT
-  SID_WRISTROT, 
-#endif  
-  SID_GRIP};
-#endif
+// status messages for IK return codes..
+enum {
+  IKS_SUCCESS=0, IKS_WARNING, IKS_ERROR};
 
 
 #define CNT_SERVOS  8 //(sizeof(pgm_axdIDs)/sizeof(pgm_axdIDs[0]))
@@ -92,6 +85,7 @@ static const byte pgm_axdIDs[] PROGMEM = {
 #define G_OFFSET            0      // Offset for static side of gripper?
 #define RToD                57.295779  // Radians to degrees.
 
+#define IK_FUDGE            5     // How much a fudge between warning and error
 
 //=============================================================================
 // Global Objects
@@ -104,6 +98,8 @@ BioloidController bioloid = BioloidController(1000000);
 //=============================================================================
 boolean         g_fArmActive = false;   // Is the arm logically on?
 byte            g_bIKMode = IKM_IK3D;   // Which mode of operation are we in...
+uint8_t         g_bIKStatus = IKS_SUCCESS;   // Status of last call to DoArmIK;
+boolean         g_fServosFree = true;
 
 // Current IK values
 int            g_sIKGA;                  // IK Gripper angle..
@@ -133,7 +129,7 @@ boolean        g_fDebugOutput = false;
 #endif
 
 // Forward references
-extern boolean ProcessUserInputBackHoe(void);
+extern void MSound(byte cNotes, ...);
 
 //===================================================================================================
 // Setup 
@@ -156,8 +152,11 @@ void setup() {
   bioloid.readPose();
   // Start off to put arm to sleep...
   Serial.println("Kurt's Arm");
-  
+
   PutArmToSleep();
+
+  MSound(3, 60, 2000, 80, 2250, 100, 2500);
+
 }
 //===================================================================================================
 // loop: Our main Loop!
@@ -184,9 +183,13 @@ void loop() {
         MoveArmToHome();      
 
       }
+      else if ((command.buttons & BUT_R2) && !(buttonsPrev & BUT_R2)) {
+        MoveArmToHome();      
+      }
 #ifdef DEBUG
       if ((command.buttons & BUT_R3) && !(buttonsPrev & BUT_R3)) {
         g_fDebugOutput = !g_fDebugOutput;
+        MSound( 1, 45, g_fDebugOutput? 3000 : 2000);
       }
 #endif
       // Going to use L6 in combination with the right joystick to control both the gripper and the 
@@ -210,7 +213,8 @@ void loop() {
           break;
         }
       }
-      if (fChanged) {
+      // If something changed and we are not in an error condition
+      if (fChanged && (g_bIKStatus != IKS_ERROR)) {
         MoveArmTo(sBase, sShoulder, sElbow, sWrist, sWristRot, sGrip, 100, true);
       }
       else if (bioloid.interpolating > 0) {
@@ -254,16 +258,34 @@ boolean ProcessUserInput3D(void) {
   int   sIKY;                  //
   int   sIKZ;
   int   sIKGA;
+  // Limit how far we can go by checking the status of the last move.  If we are in a warning or error
+  // condition, don't allow the arm to move farther away...
+  if (g_bIKStatus == IKS_SUCCESS) {
+    sIKX = min(max(g_sIKX + command.walkH/6, IK_MIN_X), IK_MAX_X);
+    sIKY = min(max(g_sIKY + command.walkV/6, IK_MIN_Y), IK_MAX_Y);
+    sIKZ = min(max(g_sIKZ + command.lookV/6, IK_MIN_Z), IK_MAX_Z);
+    sIKGA = min(max(g_sIKGA + command.lookH/10, IK_MIN_GA), IK_MAX_GA);  // Currently in Servo coords...
+  } 
+  else {
+    // In an Error/warning condition, only allow things to move in closer...
+    sIKX = g_sIKX;
+    sIKY = g_sIKY;
+    sIKZ = g_sIKZ;
+    sIKGA = g_sIKGA;
 
-  sIKX = min(max(g_sIKX + command.walkH/6, IK_MIN_X), IK_MAX_X);
-  sIKY = min(max(g_sIKY + command.walkV/6, IK_MIN_Y), IK_MAX_Y);
-  sIKZ = min(max(g_sIKZ + command.lookV/6, IK_MIN_Z), IK_MAX_Z);
-  sIKGA = min(max(g_sIKGA + command.lookH/6, IK_MIN_GA), IK_MAX_GA);  // Currently in Servo coords...
-
+    if (((g_sIKX > 0) && (command.walkH < 0)) || ((g_sIKX < 0) && (command.walkH > 0)))
+      sIKX = min(max(g_sIKX + command.walkH/6, IK_MIN_X), IK_MAX_X);
+    if (((g_sIKY > 0) && (command.walkV < 0)) || ((g_sIKY < 0) && (command.walkV > 0)))
+      sIKY = min(max(g_sIKY + command.walkV/6, IK_MIN_Y), IK_MAX_Y);
+    if (((g_sIKZ > 0) && (command.lookV < 0)) || ((g_sIKZ < 0) && (command.lookV > 0)))
+      sIKZ = min(max(g_sIKZ + command.lookV/6, IK_MIN_Z), IK_MAX_Z);
+    if (((g_sIKGA > 0) && (command.lookH < 0)) || ((g_sIKGA < 0) && (command.lookH > 0)))
+      sIKGA = min(max(g_sIKGA + command.lookH/6, IK_MIN_GA), IK_MAX_GA);  // Currently in Servo coords...
+  }
   fChanged = (sIKX != g_sIKX) || (sIKY != g_sIKY) || (sIKZ != g_sIKZ) || (sIKGA != g_sIKGA) ;
 
   if (fChanged) {
-    doArmIK(true, sIKX, sIKY, sIKZ, sIKGA);
+    g_bIKStatus = doArmIK(true, sIKX, sIKY, sIKZ, sIKGA);
   }
   return fChanged;
 }
@@ -307,11 +329,13 @@ boolean ProcessUserInputBackHoe() {
 void MoveArmToHome(void) {
 
   if (g_bIKMode != IKM_BACKHOE) {
-    doArmIK(true, 0, (2*ElbowLength)/3+WristLength, BaseHeight+(2*ShoulderLength)/3, 0);
+    g_bIKStatus = doArmIK(true, 0, (2*ElbowLength)/3+WristLength, BaseHeight+(2*ShoulderLength)/3, 0);
     MoveArmTo(sBase, sShoulder, sElbow, sWrist, 512, 256, 500, true);
   }
-  else
+  else {
+    g_bIKStatus = IKS_SUCCESS;  // assume sucess so we will continue to move...
     MoveArmTo(512, 512, 330, 690, 512, 256, 500, true);
+  }
 }
 
 //===================================================================================================
@@ -320,6 +344,12 @@ void MoveArmToHome(void) {
 void PutArmToSleep(void) {
   g_fArmActive = false;
   MoveArmTo(512, 212, 212, 512, 512, 256, 1000, true);
+
+  // And Relax all of the servos...
+  for(uint8_t i=1; i <= CNT_SERVOS; i++) {
+    Relax(i);
+  }
+  g_fServosFree = true;
 }
 
 //===================================================================================================
@@ -327,32 +357,61 @@ void PutArmToSleep(void) {
 //===================================================================================================
 void MoveArmTo(int sBase, int sShoulder, int sElbow, int sWrist, int sWristRot, int sGrip, int wTime, boolean fWait) {
 
+  int sMaxDelta;
+  int sDelta;
+
+  // First make sure servos are not free...
+  if (g_fServosFree) {
+    g_fServosFree = false;
+
+    for(uint8_t i=1; i <= CNT_SERVOS; i++) {
+      TorqueOn(i);
+    }
+    bioloid.readPose();
+  }
+
+
 #ifdef DEBUG
-   if (g_fDebugOutput) {
-     Serial.print("[");
-     Serial.print(sBase, DEC);
-     Serial.print(" ");
-     Serial.print(sShoulder, DEC);
-     Serial.print(" ");
-     Serial.print(sElbow, DEC);
-     Serial.print(" ");
-     Serial.print(sWrist, DEC);
-     Serial.print(" ");
-     Serial.print(sWristRot, DEC);
-     Serial.print(" ");
-     Serial.print(sGrip, DEC);
-     Serial.println("]");
-   }
+  if (g_fDebugOutput) {
+    Serial.print("[");
+    Serial.print(sBase, DEC);
+    Serial.print(" ");
+    Serial.print(sShoulder, DEC);
+    Serial.print(" ");
+    Serial.print(sElbow, DEC);
+    Serial.print(" ");
+    Serial.print(sWrist, DEC);
+    Serial.print(" ");
+    Serial.print(sWristRot, DEC);
+    Serial.print(" ");
+    Serial.print(sGrip, DEC);
+    Serial.println("]");
+  }
 #endif
-  // where to wait for last move to complete?
+  // Make sure the previous movement completed.
+  // Need to do it before setNextPos calls as this
+  // is used in the interpolating code...
+  while (bioloid.interpolating > 0) {
+    bioloid.interpolateStep();
+    delay(3);
+  }
+
+  // Also lets limit how fast the servos will move as to not get whiplash.
   bioloid.setNextPose(SID_BASE, sBase);
 
+  sMaxDelta = abs(bioloid.getCurPose(SID_RSHOULDER) - sShoulder);
   bioloid.setNextPose(SID_RSHOULDER, sShoulder);
   bioloid.setNextPose(SID_LSHOULDER, 1024-sShoulder);
 
+  sDelta = abs(bioloid.getCurPose(SID_RELBOW) - sElbow);
+  if (sDelta > sMaxDelta)
+    sMaxDelta = sDelta;
   bioloid.setNextPose(SID_RELBOW, sElbow);
   bioloid.setNextPose(SID_LELBOW, 1024-sElbow);
 
+  sDelta = abs(bioloid.getCurPose(SID_WRIST) - sWrist);
+  if (sDelta > sMaxDelta)
+    sMaxDelta = sDelta;
   bioloid.setNextPose(SID_WRIST, sWrist);
 
 #ifdef OPT_WRISTROT
@@ -361,8 +420,6 @@ void MoveArmTo(int sBase, int sShoulder, int sElbow, int sWrist, int sWristRot, 
 
   bioloid.setNextPose(SID_GRIP, sGrip);
 
-  // Do at least the first movement
-  bioloid.interpolateStep();
 
   // Save away the current positions...
   g_sBase = sBase;
@@ -372,14 +429,15 @@ void MoveArmTo(int sBase, int sShoulder, int sElbow, int sWrist, int sWristRot, 
   g_sWristRot = sWristRot;
   g_sGrip = sGrip;
 
-  // Make sure the previous movement completed.
-  while (bioloid.interpolating > 0) {
-    bioloid.interpolateStep();
-    delay(3);
+  // Now start the move - But first make sure we don't move too fast.  
+  if (((long)sMaxDelta*wTime/1000L) > MAX_SERVO_DELTA_PERSEC) {
+    wTime = ((long)sMaxDelta*1000L)/ MAX_SERVO_DELTA_PERSEC;
   }
 
-  // Now start the move
   bioloid.interpolateSetup(wTime);
+
+  // Do at least the first movement
+  bioloid.interpolateStep();
 
   // And if asked to, wait for the previous move to complete...
   if (fWait) {
@@ -403,20 +461,21 @@ int radToServo(float rads){
 // Compute Arm IK for 3DOF+Mirrors+Gripper - was based on code by Michael E. Ferguson
 // Hacked up by me, to allow different options...
 //===================================================================================================
-void doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sGrip)
+uint8_t doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sIKGA)
 {
+  uint8_t bRet = IKS_SUCCESS;  // assume success
 #ifdef DEBUG
-   if (g_fDebugOutput) {
-     Serial.print("(");
-     Serial.print(sIKX, DEC);
-     Serial.print(",");
-     Serial.print(sIKY, DEC);
-     Serial.print(",");
-     Serial.print(sIKZ, DEC);
-     Serial.print(",");
-     Serial.print(sGrip, DEC);
-     Serial.print(")=");
-   }
+  if (g_fDebugOutput) {
+    Serial.print("(");
+    Serial.print(sIKX, DEC);
+    Serial.print(",");
+    Serial.print(sIKY, DEC);
+    Serial.print(",");
+    Serial.print(sIKZ, DEC);
+    Serial.print(",");
+    Serial.print(sIKGA, DEC);
+    Serial.print(")=");
+  }
 #endif
   // first, make this a 2DOF problem... by solving base
   int sol0 = radToServo(atan2(sIKX,sIKY));
@@ -427,11 +486,18 @@ void doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sGrip)
   sol0 -= radToServo(atan2((G/2)-G_OFFSET,t));
 
   // convert to sIKX/sIKZ plane, remove wrist, prepare to solve other DOF           
-  long trueX = t - (long)((float)WristLength*cos(sGrip));   
-  long trueZ = sIKZ - BaseHeight - (long)((float)WristLength*sin(sGrip));
+  float flGripRad = (float)(sIKGA)*3.14159/180.0;
 
-  long im = sqrt(sq(trueX)+sq(trueZ));        // length of imaginary arm      
+#ifdef DEBUG
+  if (g_fDebugOutput) {
+    Serial.print(flGripRad, DEC);
+    Serial.print(" ");
+  }
+#endif
+  long trueX = t - (long)((float)WristLength*cos(flGripRad));   
+  long trueZ = sIKZ - BaseHeight - (long)((float)WristLength*sin(flGripRad));
 
+  long im = sqrt(sq(trueX)+sq(trueZ));        // length of imaginary arm
   float q1 = atan2(trueZ,trueX);              // angle between im and X axis
   long d1 = sq(ShoulderLength) - sq(ElbowLength) + sq((long)im);
   long d2 = 2*ShoulderLength*im;
@@ -445,24 +511,24 @@ void doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sGrip)
   int sol2 = radToServo(3.14-q2);
 
   // solve for wrist rotate
-  int sol3 = radToServo(3.2 + sGrip - q1 - q2 );
+  int sol3 = radToServo(3.2 + flGripRad - q1 - q2 );
 
 #ifdef DEBUG
-   if (g_fDebugOutput) {
-     Serial.print("<");
-     Serial.print(sol0, DEC);
-     Serial.print(",");
-     Serial.print(trueX, DEC);
-     Serial.print(",");
-     Serial.print(trueZ, DEC);
-     Serial.print(",");
-     Serial.print(sol1, DEC);
-     Serial.print(",");
-     Serial.print(sol2, DEC);
-     Serial.print(",");
-     Serial.print(sol3, DEC);
-     Serial.print(">");
-   }
+  if (g_fDebugOutput) {
+    Serial.print("<");
+    Serial.print(sol0, DEC);
+    Serial.print(",");
+    Serial.print(trueX, DEC);
+    Serial.print(",");
+    Serial.print(trueZ, DEC);
+    Serial.print(",");
+    Serial.print(sol1, DEC);
+    Serial.print(",");
+    Serial.print(sol2, DEC);
+    Serial.print(",");
+    Serial.print(sol3, DEC);
+    Serial.print(">");
+  }
 #endif   
 
   // Lets calculate the actual servo values.
@@ -480,74 +546,93 @@ void doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sGrip)
   g_sIKX = sIKX; 
   g_sIKY = sIKY;
   g_sIKZ = sIKZ;
-  g_sGrip = sGrip;
-}
+  g_sIKGA = sIKGA;
+  // Simple test im can not exceed the length of the Shoulder+Elbow joints...
 
-
-//===================================================================================================
-// ArmIK: compute the desired angles for each of the servos given a desired coordinate.  We will start
-//   off doing floating point math as it is easier... Also we may go in with given servo angles
-//   for the Wrist...
-//===================================================================================================
-#if 0
-
-boolean ArmIk(float IKGripperPosX, float IKGripperPosY, float sBase, float WristAngle, int sWristRot, int sGrip) //Here's all the Inverse Kinematics to control the arm
-{
-  // First calculate the length from the shoulder to the gripper
-  // We will first adjust the IKGripperPosY by the base height so we don't have to do this everywhere in
-  // this functions
-  IKGripperPosY -= BaseHeight;
-  float IKSW = sqrt((IKGripperPosY*IKGripperPosY)+(IKGripperPosX*IKGripperPosX));
-
-  // Now lets compute the Wrist position of the wrist given the Gripper position plus it's angle
-  // and it's length
-  float IKWristPosX = IKGripperPosX - (cos(WristAngle) * WristLength);
-  float IKWristPosY = IKGripperPosY - (sin(WristAngle) * WristLength);
-
-  // Calculate a new length between shoulder and Wrist 
-  IKSW = sqrt((IKWristPosX*IKWristPosX)+(IKGripperPosY*IKGripperPosY));
-
-  // Compute angle between SW lien and ground in radians.
-  float A1 = atan(IKWristPosY/IKWristPosX);
-
-  float A2 = acos((ShoulderLength*ShoulderLength-ElbowLength*ElbowLength+IKSW*IKSW)/((ShoulderLength*2)*IKSW));
-  float IKElbow = acos((ShoulderLength*ShoulderLength+ElbowLength*ElbowLength-IKSW*IKSW)/((ShoulderLength*2)*ElbowLength));
-  float IKShoulder = A1 + A2;
-
-  IKElbow = IKElbow * RToD;
-  IKShoulder = IKShoulder * RToD;
-  if((int)IKElbow <= 0 || (int)IKShoulder <= 0)
-    return false;
-
-  float IKWrist = abs(WristAngle - IKElbow - IKShoulder) - 90;
-#if 0  
-  Elb.write(180 - Elbow);
-  Shldr.write(Shoulder);
-  Wrist.write(180 - Wris);
-  Base.write(z);
-  WristR.write(wr);
-  Gripper.write(g);
-  WristY = tmpy;
-  WristX = tmpx;
-  Z = tmpz;
-  WA = tmpwa;
-  G = tmpg;
-  WR = tmpwr;
-#endif  
-  return true;
-
-}
+  if (im > (ShoulderLength + ElbowLength)) {
+    if (g_bIKStatus != IKS_ERROR) {
+#ifdef DEBUG
+      if (g_fDebugOutput) {
+        Serial.println("IK Error");
+      }
 #endif
+      MSound(2, 50, 3000, 50, 3000);
+    }
+    bRet = IKS_ERROR;  
+  }
+  else if(im > (ShoulderLength + ElbowLength-IK_FUDGE)) {
+    if (g_bIKStatus != IKS_WARNING) {
+#ifdef DEBUG
+      if (g_fDebugOutput) {
+        Serial.println("IK Warning");
+      }
+#endif
+      MSound(1, 75, 2500);
+    }
+    bRet = IKS_WARNING;  
+  }
 
+  return bRet;
+}
+// BUGBUG:: Move to some library...
+//==============================================================================
+//    SoundNoTimer - Quick and dirty tone function to try to output a frequency
+//            to a speaker for some simple sounds.
+//==============================================================================
+#ifdef SOUND_PIN
+void SoundNoTimer(unsigned long duration,  unsigned int frequency)
+{
+#ifdef __AVR__
+  volatile uint8_t *pin_port;
+  volatile uint8_t pin_mask;
+#else
+  volatile uint32_t *pin_port;
+  volatile uint16_t pin_mask;
+#endif
+  long toggle_count = 0;
+  long lusDelayPerHalfCycle;
 
+  // Set the pinMode as OUTPUT
+  pinMode(SOUND_PIN, OUTPUT);
 
+  pin_port = portOutputRegister(digitalPinToPort(SOUND_PIN));
+  pin_mask = digitalPinToBitMask(SOUND_PIN);
 
+  toggle_count = 2 * frequency * duration / 1000;
+  lusDelayPerHalfCycle = 1000000L/(frequency * 2);
 
+  // if we are using an 8 bit timer, scan through prescalars to find the best fit
+  while (toggle_count--) {
+    // toggle the pin
+    *pin_port ^= pin_mask;
 
+    // delay a half cycle
+    delayMicroseconds(lusDelayPerHalfCycle);
+  }    
+  *pin_port &= ~(pin_mask);  // keep pin low after stop
 
+}
 
+void MSound(byte cNotes, ...)
+{
+  va_list ap;
+  unsigned int uDur;
+  unsigned int uFreq;
+  va_start(ap, cNotes);
 
-
+  while (cNotes > 0) {
+    uDur = va_arg(ap, unsigned int);
+    uFreq = va_arg(ap, unsigned int);
+    SoundNoTimer(uDur, uFreq);
+    cNotes--;
+  }
+  va_end(ap);
+}
+#else
+void MSound(byte cNotes, ...)
+{
+};
+#endif
 
 
 
