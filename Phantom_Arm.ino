@@ -1,9 +1,46 @@
 #define DEBUG
 //=============================================================================
-//Project Kurt's PhantomX Reactor Arm -  With a few different modes of operatoin
-//  an IK mode based in part on code by Michael E. Ferguson... X, Y, Z all computed
-//  An IK mode where the Base rotate is done independent and then IK for the other two directions
-//  a Backhoe mode based on my my BackHoe...
+//Project Kurt's PhantomX Reactor Arm
+// This code is setup to control a PhantomX Reactor Arm which is sold by Trossen
+// Robotics: http:www.trossenrobotics.com/p/phantomx-ax-12-reactor-robot-arm.aspx
+// This code uses a Arbotix Commander 2 to control it, also sold by Trossen 
+// Robotics: http:www.trossenrobotics.com/p/arbotix-commander-gamepad-v2.aspx
+//
+//  There are a couple of buttons that I am currently using for all modes, which include:
+//    Turning Commander on/off - When the Arm starts receiving valid packets, it assumes
+//    the commander is on and it turns on the servos moves the arm to the home position.  If
+//    the arm does not receive a valid packet for a time out period of time it assumes the 
+//    commander has been turned off and it moves the arm to a park position and then frees
+//    the servos.
+//  
+//    R1 - Cycles through the different Modes.
+//    R2 - Moves the arm to its home position.
+//    R3 - Toggles debug mode on or off (optional, turn off by un-defining DEBUG).  When on, it outputs
+//		debug information to the Serial port.  I use a simple VB forwarding app to forward messages from 
+//		commander to robot, and robot sent messages show up on terminal...
+//
+//  The code currently has a few different modes of operation.
+//  Mode 1: 3d Cartesian IK code, which is based in part off of code by Michael E. Ferguson
+//    x is controlled by left joystick horizontal
+//    y by left joystick vertical
+//    z by right joystick vertical
+//    Grip angle by right joystick horizontal
+//    Gripper and Wrist rotate are controlled by holding L6 and right joystick.
+//  Mode 2: 3/2D cylindrical coordinate system.  More or less like 1: except
+//    Base Rotation control by left joystick horizontal
+//    Distance from base by left vertical
+//    ..
+//  Mode 3: Backhoe operation
+//    Left Horizontal - Rotate
+//    Left Vertical - Controls the dipper (elbow to wrist)
+//    Right Veritical - Controls Boom (Shoulder to Elbow)
+//    Right Horizontal - Bucket Curl...
+//    ...
+//
+//  This code is a Work In Progress and is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or 
+//  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License for more details.
+//  
 //=============================================================================
 
 //=============================================================================
@@ -28,7 +65,7 @@ enum {
   SID_BASE=1, SID_RSHOULDER, SID_LSHOULDER, SID_RELBOW, SID_LELBOW, SID_WRIST, SID_WRISTROT, SID_GRIP};
 
 enum {
-  IKM_IK3D, IKM_IK2D, IKM_BACKHOE};
+  IKM_IK3D_CARTESIAN, IKM_CYLINDRICAL, IKM_BACKHOE};
 
 // status messages for IK return codes..
 enum {
@@ -76,14 +113,13 @@ enum {
 #define GRIP_MAX     512
 
 // Define some lengths and offsets used by the arm
-#define BaseHeight          85L //110    // (L0)about 120mm 
-#define ShoulderLength      150L    // (L1)Not sure yet what to do as the servo is not directly in line,  Probably best to offset the angle?
+#define BaseHeight          110L   // (L0)about 120mm 
+#define ShoulderLength      150L   // (L1)Not sure yet what to do as the servo is not directly in line,  Probably best to offset the angle?
 //                                 // X is about 140, y is about 40 so sqrt is Hyp is about 155, so maybe about 21 degrees offset
-#define ShoulderServoOffset  72L    // should offset us some...
-#define ElbowLength          147L   //(L2)Length of the Arm from Elbow Joint to Wrist Joint
-#define WristLength         106L //137    // (L3)Wrist length including Wrist rotate
+#define ShoulderServoOffset 72L    // should offset us some...
+#define ElbowLength         147L   //(L2)Length of the Arm from Elbow Joint to Wrist Joint
+#define WristLength         137L   // (L3)Wrist length including Wrist rotate
 #define G_OFFSET            0      // Offset for static side of gripper?
-#define RToD                57.295779  // Radians to degrees.
 
 #define IK_FUDGE            5     // How much a fudge between warning and error
 
@@ -97,7 +133,7 @@ BioloidController bioloid = BioloidController(1000000);
 // Global Variables...
 //=============================================================================
 boolean         g_fArmActive = false;   // Is the arm logically on?
-byte            g_bIKMode = IKM_IK3D;   // Which mode of operation are we in...
+byte            g_bIKMode = IKM_IK3D_CARTESIAN;   // Which mode of operation are we in...
 uint8_t         g_bIKStatus = IKS_SUCCESS;   // Status of last call to DoArmIK;
 boolean         g_fServosFree = true;
 
@@ -136,18 +172,11 @@ extern void MSound(byte cNotes, ...);
 //====================================================================================================
 void setup() {
   // Lets initialize the Commander
-  uint8_t i;
   command.begin(38400);
 
   // Next initialize the Bioloid
   bioloid.poseSize = CNT_SERVOS;
 
-  // Set the id for each of the servos
-#if 0  // bugbug:: when I do this code only the base and shoulder servos work???
-  for (i=0; i < CNT_SERVOS; i++) {
-    bioloid.setId(i, pgm_axdIDs[i]);
-  }
-#endif
   // Read in the current positions...
   bioloid.readPose();
   // Start off to put arm to sleep...
@@ -201,11 +230,11 @@ void loop() {
       }
       else {
         switch (g_bIKMode) {
-        case IKM_IK3D:
+        case IKM_IK3D_CARTESIAN:
           fChanged |= ProcessUserInput3D();
           break;
-        case IKM_IK2D:
-          fChanged |= ProcessUserInput2D();
+        case IKM_CYLINDRICAL:
+          fChanged |= ProcessUserInputCylindrical();
           break;
 
         case IKM_BACKHOE:
@@ -291,10 +320,53 @@ boolean ProcessUserInput3D(void) {
 }
 
 //===================================================================================================
-// ProcessUserInput2D: Process the Userinput when we are in 3d Mode
+// ProcessUserInputCylindrical: Process the Userinput when we are in 3d Mode
 //===================================================================================================
-boolean ProcessUserInput2D() {
-  return false;  // Not implemented yet so no changes...
+boolean ProcessUserInputCylindrical() {
+  // We Are in IK mode, so figure out what position we would like the Arm to move to.
+  // We have the Coordinates system like:
+  //
+  //                y   Z
+  //                |  /
+  //                |/
+  //            ----+----X (X and Y are flat on ground, Z is up in air...
+  //                |
+  //                |
+  //
+  boolean fChanged = false;
+  int   sIKY;                  // Distance from base in mm
+  int   sIKZ;
+  int   sIKGA;
+
+  // Will try combination of the other two modes.  Will see if I need to do the Limits on the IK values
+  // or simply use the information from the Warning/Error from last call to the IK function...
+  sIKY = g_sIKY;
+  sIKZ = g_sIKZ;
+  sIKGA = g_sIKGA;
+
+  // The base rotate is real simple, just allow it to rotate in the min/max range...
+  sBase = min(max(g_sBase - command.walkH/6, BASE_MIN), BASE_MAX);
+
+  // Limit how far we can go by checking the status of the last move.  If we are in a warning or error
+  // condition, don't allow the arm to move farther away...
+  // Use Y for 2d distance from base
+  if ((g_bIKStatus == IKS_SUCCESS) || ((g_sIKY > 0) && (command.walkV < 0)) || ((g_sIKY < 0) && (command.walkV > 0)))
+    sIKY += command.walkV/6;
+
+  // Now Z coordinate...
+  if ((g_bIKStatus == IKS_SUCCESS) || ((g_sIKZ > 0) && (command.lookV < 0)) || ((g_sIKZ < 0) && (command.lookV > 0)))
+    sIKZ += command.lookV/6;
+
+  // And gripper angle.  May leave in Min/Max here for other reasons...   
+  if ((g_bIKStatus == IKS_SUCCESS) || ((g_sIKGA > 0) && (command.lookH < 0)) || ((g_sIKGA < 0) && (command.lookH > 0)))
+    sIKGA = min(max(g_sIKGA + command.lookH/6, IK_MIN_GA), IK_MAX_GA);  // Currently in Servo coords...
+
+  fChanged = (sBase != g_sBase) || (sIKY != g_sIKY) || (sIKZ != g_sIKZ) || (sIKGA != g_sIKGA) ;
+
+  if (fChanged) {
+    g_bIKStatus = doArmIK(false, sBase, sIKY, sIKZ, sIKGA);
+  }
+  return fChanged;
 }
 //===================================================================================================
 // ProcessUserInputBackHoe: Process the Userinput when we are in 3d Mode
@@ -303,7 +375,7 @@ boolean ProcessUserInputBackHoe() {
   // lets update positions with the 4 joystick values
   // First the base
   boolean fChanged = false;
-  sBase = min(max(g_sBase + command.walkH/6, BASE_MIN), BASE_MAX);
+  sBase = min(max(g_sBase - command.walkH/6, BASE_MIN), BASE_MAX);
   if (sBase != g_sBase)
     fChanged = true;
 
@@ -461,8 +533,10 @@ int radToServo(float rads){
 // Compute Arm IK for 3DOF+Mirrors+Gripper - was based on code by Michael E. Ferguson
 // Hacked up by me, to allow different options...
 //===================================================================================================
-uint8_t doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sIKGA)
+uint8_t doArmIK(boolean fCartesian, int sIKX, int sIKY, int sIKZ, int sIKGA)
 {
+  int t;
+  int sol0;
   uint8_t bRet = IKS_SUCCESS;  // assume success
 #ifdef DEBUG
   if (g_fDebugOutput) {
@@ -477,23 +551,24 @@ uint8_t doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sIKGA)
     Serial.print(")=");
   }
 #endif
-  // first, make this a 2DOF problem... by solving base
-  int sol0 = radToServo(atan2(sIKX,sIKY));
-  // remove gripper offset from base
-  int t = sqrt(sq((long)sIKX)+sq((long)sIKY));
-  // BUGBUG... Not sure about G here
+  if (fCartesian) {
+    // first, make this a 2DOF problem... by solving base
+    sol0 = radToServo(atan2(sIKX,sIKY));
+    // remove gripper offset from base
+    t = sqrt(sq((long)sIKX)+sq((long)sIKY));
+    // BUGBUG... Not sure about G here
 #define G 30   
-  sol0 -= radToServo(atan2((G/2)-G_OFFSET,t));
-
+    sol0 -= radToServo(atan2((G/2)-G_OFFSET,t));
+  }
+  else {
+    // We are in cylindrical mode, probably simply set t to the y we passed in...
+    t = sIKY;
+#ifdef DEBUG
+    sol0 = 0;
+#endif
+  }
   // convert to sIKX/sIKZ plane, remove wrist, prepare to solve other DOF           
   float flGripRad = (float)(sIKGA)*3.14159/180.0;
-
-#ifdef DEBUG
-  if (g_fDebugOutput) {
-    Serial.print(flGripRad, DEC);
-    Serial.print(" ");
-  }
-#endif
   long trueX = t - (long)((float)WristLength*cos(flGripRad));   
   long trueZ = sIKZ - BaseHeight - (long)((float)WristLength*sin(flGripRad));
 
@@ -532,8 +607,10 @@ uint8_t doArmIK(boolean f3D, int sIKX, int sIKY, int sIKZ, int sIKGA)
 #endif   
 
   // Lets calculate the actual servo values.
-  sBase = min(max(512 - sol0, BASE_MIN), BASE_MAX);
 
+  if (fCartesian) {
+    sBase = min(max(512 - sol0, BASE_MIN), BASE_MAX);
+  }
   sShoulder = min(max(512 - sol1, SHOULDER_MIN), SHOULDER_MAX);
 
   // Magic Number 819???
@@ -633,6 +710,9 @@ void MSound(byte cNotes, ...)
 {
 };
 #endif
+
+
+
 
 
 
